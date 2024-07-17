@@ -2,109 +2,145 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"log"
-	"math"
 	"os"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-
-	_ "go.uber.org/automaxprocs"
 )
 
-var (
-	measurementsFile = "../../../../data/measurements.txt"
-	workers          = runtime.NumCPU() // Number of goroutines for processing lines
-)
+var measurementsFile = "../../../../data/measurements.txt"
+var workers = runtime.GOMAXPROCS(0) * 2
+var batchSize = 1000
 
-type StationSummary struct {
-	Min, Max, Sum, Count float64
-	mu                   sync.Mutex
+type Summary struct {
+	Station       string
+	Min, Max, Sum float64
+	Count         uint
+}
+
+type KeyValueStore struct {
+	store sync.Map
+}
+
+func NewKeyValueStore() *KeyValueStore {
+	return &KeyValueStore{}
+}
+
+func (kvs *KeyValueStore) Set(key string, value Summary) {
+	kvs.store.Store(key, value)
+}
+
+func (kvs *KeyValueStore) Get(key string) (Summary, error) {
+	value, exists := kvs.store.Load(key)
+	if !exists {
+		return Summary{}, errors.New("key not found")
+	}
+	return value.(Summary), nil
+}
+
+func (kvs *KeyValueStore) PrintAll() {
+	kvs.store.Range(func(key, value interface{}) bool {
+		data := value.(Summary)
+		fmt.Printf("%s, %f, %f, %f\n", key, data.Min, data.Sum/float64(data.Count), data.Max)
+		return true
+	})
 }
 
 func main() {
 	started := time.Now()
-	err := run()
-	if err != nil {
-		log.Println(err)
+	if err := processFile(); err != nil {
+		log.Fatal(err)
 	}
 	fmt.Printf("Elapsed time: %+v\n", time.Since(started))
 }
 
-func run() (err error) {
+func processFile() error {
 	file, err := os.Open(measurementsFile)
 	if err != nil {
-		fmt.Println("Error opening file:", err)
-		return
+		return err
 	}
 	defer file.Close()
 
-	results := map[string]*StationSummary{}
-	var mu sync.Mutex
+	kvStore := NewKeyValueStore()
 
-	lineCh := make(chan string, 1000) // Adjust buffer size as needed
+	scanner := bufio.NewScanner(file)
+	ch := make(chan []Summary, workers)
+
 	var wg sync.WaitGroup
-
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for line := range lineCh {
-				processLine(line, results, &mu)
+			for summaries := range ch {
+				for _, summary := range summaries {
+					existingSummary, err := kvStore.Get(summary.Station)
+					if err != nil {
+						existingSummary = summary
+					} else {
+						existingSummary.Max = max(summary.Max, existingSummary.Max)
+						existingSummary.Min = min(summary.Min, existingSummary.Min)
+						existingSummary.Sum += summary.Sum
+						existingSummary.Count += summary.Count
+					}
+					kvStore.Set(summary.Station, existingSummary)
+				}
 			}
 		}()
 	}
 
-	scanner := bufio.NewScanner(file)
+	var batch []Summary
 	for scanner.Scan() {
-		lineCh <- scanner.Text()
-	}
-	close(lineCh)
+		line := scanner.Text()
+		summary, err := processLine(line)
+		if err != nil {
+			log.Println("Error processing line:", err)
+			continue
+		}
+		batch = append(batch, summary)
 
+		if len(batch) >= batchSize {
+			ch <- batch
+			batch = nil
+		}
+	}
+
+	if len(batch) > 0 {
+		ch <- batch
+	}
+	close(ch)
 	wg.Wait()
 
 	if err := scanner.Err(); err != nil {
-		fmt.Println("Error reading file:", err)
+		return err
 	}
 
-	// Print final results
-	for station, summary := range results {
-		mean := summary.Sum / summary.Count
-		fmt.Printf("%s, %.1f, %.1f, %.1f\n", station, summary.Min, mean, summary.Max)
-	}
+	kvStore.PrintAll()
 
-	return
+	return nil
 }
 
-func processLine(line string, results map[string]*StationSummary, mu *sync.Mutex) {
+func processLine(line string) (Summary, error) {
 	parts := strings.Split(line, ";")
 	if len(parts) != 2 {
-		log.Panic("Invalid line:", line)
-		return
+		return Summary{}, fmt.Errorf("invalid line: %s", line)
 	}
 
 	station := parts[0]
 	temperature, err := strconv.ParseFloat(parts[1], 64)
 	if err != nil {
-		log.Println("Error parsing temperature:", err)
-		return
+		return Summary{}, fmt.Errorf("error parsing temperature: %v", err)
 	}
 
-	mu.Lock()
-	summary, ok := results[station]
-	if !ok {
-		summary = &StationSummary{Min: temperature, Max: temperature, Sum: temperature, Count: 1}
-		results[station] = summary
-	} else {
-		summary.mu.Lock()
-		summary.Min = math.Min(summary.Min, temperature)
-		summary.Max = math.Max(summary.Max, temperature)
-		summary.Sum += temperature
-		summary.Count++
-		summary.mu.Unlock()
-	}
-	mu.Unlock()
+	return Summary{
+		Station: station,
+		Min:     temperature,
+		Max:     temperature,
+		Sum:     temperature,
+		Count:   1,
+	}, nil
 }
