@@ -2,145 +2,191 @@ package main
 
 import (
 	"bufio"
-	"errors"
+	"bytes"
+	"flag"
 	"fmt"
 	"log"
 	"os"
 	"runtime"
+	"runtime/pprof"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 )
 
-var measurementsFile = "../../../../data/measurements.txt"
-var workers = runtime.GOMAXPROCS(0) * 2
-var batchSize = 1000
+var (
+	measurementsFile = "../../../../data/measurements.txt"
+	workers          = runtime.NumCPU()
+	batchSize        = 10000
+	buffSize         = 4 * 1024 * 1024
+	appPprof         = flag.Bool("pprof", false, "write cpu profile to `file`")
+)
 
-type Summary struct {
-	Station       string
-	Min, Max, Sum float64
-	Count         uint
-}
-
-type KeyValueStore struct {
-	store sync.Map
-}
-
-func NewKeyValueStore() *KeyValueStore {
-	return &KeyValueStore{}
-}
-
-func (kvs *KeyValueStore) Set(key string, value Summary) {
-	kvs.store.Store(key, value)
-}
-
-func (kvs *KeyValueStore) Get(key string) (Summary, error) {
-	value, exists := kvs.store.Load(key)
-	if !exists {
-		return Summary{}, errors.New("key not found")
-	}
-	return value.(Summary), nil
-}
-
-func (kvs *KeyValueStore) PrintAll() {
-	kvs.store.Range(func(key, value interface{}) bool {
-		data := value.(Summary)
-		fmt.Printf("%s, %f, %f, %f\n", key, data.Min, data.Sum/float64(data.Count), data.Max)
-		return true
-	})
+// StationData holds the aggregated data for a weather station
+type StationData struct {
+	Min   float64
+	Max   float64
+	Total float64
+	Count int
 }
 
 func main() {
-	started := time.Now()
-	if err := processFile(); err != nil {
-		log.Fatal(err)
+	flag.Parse()
+	if *appPprof {
+		f, err := os.Create("cpu.pprof")
+		if err != nil {
+			log.Fatal("could not create CPU profile: ", err)
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			log.Fatal("could not start CPU profile: ", err)
+		}
+		defer pprof.StopCPUProfile()
 	}
+
+	// Use all available CPU cores
+	runtime.GOMAXPROCS(workers)
+
+	// Process the file concurrently
+	started := time.Now()
+	lines := make(chan [][]byte, workers*4)
+	data := sync.Map{}
+	var wg sync.WaitGroup
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go ProcessLines(lines, &data, &wg)
+	}
+
+	wg.Add(1)
+	go ReadFile(measurementsFile, lines, &wg)
+
+	wg.Wait()
+
+	FormatOutput(&data)
 	fmt.Printf("Elapsed time: %+v\n", time.Since(started))
+
+	if *appPprof {
+		f, err := os.Create("mem.pprof")
+		if err != nil {
+			log.Fatal("could not create memory profile: ", err)
+		}
+		defer f.Close()
+		runtime.GC() // get up-to-date statistics
+		if err := pprof.WriteHeapProfile(f); err != nil {
+			log.Fatal("could not write memory profile: ", err)
+		}
+	}
 }
 
-func processFile() error {
-	file, err := os.Open(measurementsFile)
+// ParseLine parses a line from the input file and returns the station name and temperature
+func ParseLine(line []byte) (string, float64, error) {
+	parts := bytes.Split(line, []byte(";"))
+	if len(parts) != 2 {
+		return "", 0, fmt.Errorf("invalid line format")
+	}
+	temperature, err := strconv.ParseFloat(string(parts[1]), 64)
 	if err != nil {
-		return err
+		return "", 0, err
+	}
+	return string(parts[0]), temperature, nil
+}
+
+// ProcessLines processes lines concurrently and aggregates the data per weather station
+func ProcessLines(lines <-chan [][]byte, data *sync.Map, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	for batch := range lines {
+		localData := make(map[string]*StationData)
+		for _, line := range batch {
+			station, temperature, err := ParseLine(line)
+			if err != nil {
+				fmt.Printf("Error parsing line: %v\n", err)
+				continue
+			}
+
+			if sd, exists := localData[station]; exists {
+				if temperature < sd.Min {
+					sd.Min = temperature
+				}
+				if temperature > sd.Max {
+					sd.Max = temperature
+				}
+				sd.Total += temperature
+				sd.Count++
+			} else {
+				localData[station] = &StationData{
+					Min:   temperature,
+					Max:   temperature,
+					Total: temperature,
+					Count: 1,
+				}
+			}
+		}
+
+		for station, localSD := range localData {
+			dataSD, _ := data.LoadOrStore(station, &StationData{
+				Min:   localSD.Min,
+				Max:   localSD.Max,
+				Total: localSD.Total,
+				Count: localSD.Count,
+			})
+			globalSD := dataSD.(*StationData)
+
+			if localSD.Min < globalSD.Min {
+				globalSD.Min = localSD.Min
+			}
+			if localSD.Max > globalSD.Max {
+				globalSD.Max = localSD.Max
+			}
+			globalSD.Total += localSD.Total
+			globalSD.Count += localSD.Count
+		}
+	}
+}
+
+// ReadFile reads the input file and sends lines to a channel for processing
+func ReadFile(filename string, lines chan<- [][]byte, wg *sync.WaitGroup) {
+	defer wg.Done()
+	defer close(lines)
+
+	file, err := os.Open(filename)
+	if err != nil {
+		fmt.Printf("Error opening file: %v\n", err)
+		return
 	}
 	defer file.Close()
 
-	kvStore := NewKeyValueStore()
+	reader := bufio.NewReaderSize(file, buffSize)
+	scanner := bufio.NewScanner(reader)
+	buffer := make([][]byte, 0, batchSize)
 
-	scanner := bufio.NewScanner(file)
-	ch := make(chan []Summary, workers)
-
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for summaries := range ch {
-				for _, summary := range summaries {
-					existingSummary, err := kvStore.Get(summary.Station)
-					if err != nil {
-						existingSummary = summary
-					} else {
-						existingSummary.Max = max(summary.Max, existingSummary.Max)
-						existingSummary.Min = min(summary.Min, existingSummary.Min)
-						existingSummary.Sum += summary.Sum
-						existingSummary.Count += summary.Count
-					}
-					kvStore.Set(summary.Station, existingSummary)
-				}
-			}
-		}()
-	}
-
-	var batch []Summary
 	for scanner.Scan() {
-		line := scanner.Text()
-		summary, err := processLine(line)
-		if err != nil {
-			log.Println("Error processing line:", err)
-			continue
-		}
-		batch = append(batch, summary)
-
-		if len(batch) >= batchSize {
-			ch <- batch
-			batch = nil
+		line := scanner.Bytes()
+		buffer = append(buffer, append([]byte(nil), line...))
+		if len(buffer) >= batchSize {
+			lines <- buffer
+			buffer = make([][]byte, 0, batchSize)
 		}
 	}
 
-	if len(batch) > 0 {
-		ch <- batch
+	if len(buffer) > 0 {
+		lines <- buffer
 	}
-	close(ch)
-	wg.Wait()
 
 	if err := scanner.Err(); err != nil {
-		return err
+		fmt.Printf("Error reading file: %v\n", err)
 	}
-
-	kvStore.PrintAll()
-
-	return nil
 }
 
-func processLine(line string) (Summary, error) {
-	parts := strings.Split(line, ";")
-	if len(parts) != 2 {
-		return Summary{}, fmt.Errorf("invalid line: %s", line)
-	}
-
-	station := parts[0]
-	temperature, err := strconv.ParseFloat(parts[1], 64)
-	if err != nil {
-		return Summary{}, fmt.Errorf("error parsing temperature: %v", err)
-	}
-
-	return Summary{
-		Station: station,
-		Min:     temperature,
-		Max:     temperature,
-		Sum:     temperature,
-		Count:   1,
-	}, nil
+// FormatOutput formats the aggregated data and prints it
+func FormatOutput(stationData *sync.Map) {
+	fmt.Printf("{")
+	stationData.Range(func(station, data interface{}) bool {
+		sd := data.(*StationData)
+		mean := sd.Total / float64(sd.Count)
+		fmt.Printf("%s=%.1f/%.1f/%.1f, ", station, sd.Min, mean, sd.Max)
+		return true
+	})
+	fmt.Printf("}\n")
 }
