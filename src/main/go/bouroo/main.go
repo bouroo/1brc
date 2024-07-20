@@ -47,23 +47,25 @@ func main() {
 	// Use all available CPU cores
 	runtime.GOMAXPROCS(workers)
 
-	// Process the file concurrently
 	started := time.Now()
-	lines := make(chan [][]byte, workers*4)
+	linesCh := make(chan [][]byte, workers*4)
 	data := sync.Map{}
-	var wg sync.WaitGroup
+	wg := sync.WaitGroup{}
 
+	// Process file concurrently
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
-		go ProcessLines(lines, &data, &wg)
+		go ProcessLines(linesCh, &data, &wg)
 	}
 
 	wg.Add(1)
-	go ReadFile(measurementsFile, lines, &wg)
+	go ReadFile(measurementsFile, linesCh, &wg)
 
+	// Wait for all workers to finish
 	wg.Wait()
 
 	FormatOutput(&data)
+	
 	fmt.Printf("Elapsed time: %+v\n", time.Since(started))
 
 	if *appPprof {
@@ -72,7 +74,7 @@ func main() {
 			log.Fatal("could not create memory profile: ", err)
 		}
 		defer f.Close()
-		runtime.GC() // get up-to-date statistics
+		runtime.GC()
 		if err := pprof.WriteHeapProfile(f); err != nil {
 			log.Fatal("could not write memory profile: ", err)
 		}
