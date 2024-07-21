@@ -22,7 +22,7 @@ var (
 	workers          = runtime.NumCPU()
 	batchSize        = 10000
 	buffSize         = 4 * 1024 * 1024
-	appPprof         = flag.Bool("pprof", false, "write cpu profile to `file`")
+	appPprof         = flag.Bool("pprof", false, "write CPU and memory profile")
 )
 
 // StationData holds the aggregated data for a weather station
