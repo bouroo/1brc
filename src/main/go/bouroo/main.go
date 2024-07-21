@@ -6,10 +6,12 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"runtime"
 	"runtime/pprof"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -65,7 +67,7 @@ func main() {
 	wg.Wait()
 
 	FormatOutput(&data)
-	
+
 	fmt.Printf("Elapsed time: %+v\n", time.Since(started))
 
 	if *appPprof {
@@ -103,7 +105,7 @@ func ProcessLines(lines <-chan [][]byte, data *sync.Map, wg *sync.WaitGroup) {
 		for _, line := range batch {
 			station, temperature, err := ParseLine(line)
 			if err != nil {
-				fmt.Printf("Error parsing line: %v\n", err)
+				slog.Error("ProcessLines", "ParseLine", err)
 				continue
 			}
 
@@ -154,7 +156,7 @@ func ReadFile(filename string, lines chan<- [][]byte, wg *sync.WaitGroup) {
 
 	file, err := os.Open(filename)
 	if err != nil {
-		fmt.Printf("Error opening file: %v\n", err)
+		slog.Error("ReadFile", "Open", err)
 		return
 	}
 	defer file.Close()
@@ -177,18 +179,27 @@ func ReadFile(filename string, lines chan<- [][]byte, wg *sync.WaitGroup) {
 	}
 
 	if err := scanner.Err(); err != nil {
-		fmt.Printf("Error reading file: %v\n", err)
+		slog.Error("ReadFile", "scanner", err)
 	}
 }
 
 // FormatOutput formats the aggregated data and prints it
 func FormatOutput(stationData *sync.Map) {
-	fmt.Printf("{")
+	sb := strings.Builder{}
+	sb.WriteString("{")
+	first := true
 	stationData.Range(func(station, data interface{}) bool {
+		if first {
+			first = false
+		} else {
+			sb.WriteString(", ")
+		}
 		sd := data.(*StationData)
 		mean := sd.Total / float64(sd.Count)
-		fmt.Printf("%s=%.1f/%.1f/%.1f, ", station, sd.Min, mean, sd.Max)
+		sb.WriteString(fmt.Sprintf("%s=%.1f/%.1f/%.1f", station, sd.Min, mean, sd.Max))
 		return true
 	})
-	fmt.Printf("}\n")
+	sb.WriteString("}")
+
+	fmt.Fprintln(os.Stdout, sb.String())
 }
