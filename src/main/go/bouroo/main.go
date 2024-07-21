@@ -10,6 +10,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/pprof"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -103,7 +104,7 @@ func ProcessLines(lines <-chan [][]byte, data *sync.Map, wg *sync.WaitGroup) {
 	for batch := range lines {
 		localData := make(map[string]*StationData)
 		for _, line := range batch {
-			station, temperature, err := ParseLine(line)
+			station, temperature, err := ParseLine(bytes.TrimSpace(line))
 			if err != nil {
 				slog.Error("ProcessLines", "ParseLine", err)
 				continue
@@ -183,23 +184,30 @@ func ReadFile(filename string, lines chan<- [][]byte, wg *sync.WaitGroup) {
 	}
 }
 
-// FormatOutput formats the aggregated data and prints it
+type StationDataKey struct {
+	Name string
+	Data *StationData
+}
+
 func FormatOutput(stationData *sync.Map) {
-	sb := strings.Builder{}
-	sb.WriteString("{")
-	first := true
+	var stations []StationDataKey
 	stationData.Range(func(station, data interface{}) bool {
-		if first {
-			first = false
-		} else {
-			sb.WriteString(", ")
-		}
-		sd := data.(*StationData)
-		mean := sd.Total / float64(sd.Count)
-		sb.WriteString(fmt.Sprintf("%s=%.1f/%.1f/%.1f", station, sd.Min, mean, sd.Max))
+		stations = append(stations, StationDataKey{Name: station.(string), Data: data.(*StationData)})
 		return true
 	})
-	sb.WriteString("}")
+
+	sort.Slice(stations, func(i, j int) bool {
+		return stations[i].Name < stations[j].Name
+	})
+
+	sb := strings.Builder{}
+	for i, station := range stations {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		mean := station.Data.Total / float64(station.Data.Count)
+		sb.WriteString(fmt.Sprintf("%s;%.1f;%.1f;%.1f\n", station.Name, station.Data.Min, mean, station.Data.Max))
+	}
 
 	fmt.Fprintln(os.Stdout, sb.String())
 }
